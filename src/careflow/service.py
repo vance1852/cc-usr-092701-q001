@@ -7,6 +7,7 @@ import hashlib
 import secrets
 from typing import Any
 
+from . import archives
 from . import audit
 from .clock import Clock, SystemClock
 from .db import Database, decode_json, encode_json
@@ -237,7 +238,8 @@ class Careflow:
                 raise NotFound("患者不存在")
             result = {"id": row["id"], "clinic_id": row["clinic_id"], "external_ref": row["external_ref"],
                       "display_name": row["display_name"], "birth_date": row["birth_date"],
-                      "state": row["state"], "version": row["version"], "created_at": row["created_at"]}
+                      "state": row["state"], "version": row["version"], "created_at": row["created_at"],
+                      "merged_into": archives.merge_outcome(connection, clinic_id, row)}
             if include_contact:
                 authorize(principal, "clinical:read", clinic_id=clinic_id)
                 result["phone_ciphertext"] = row["phone_ciphertext"]
@@ -245,6 +247,12 @@ class Careflow:
 
     def merge_patients(self, clinic_id: str, actor_id: str, source_id: str, target_id: str,
                        *, expected_source: int, expected_target: int, reason: str) -> dict[str, Any]:
+        """合并重复档案。历史业务行与审计事件保持原编号不改写，保留档案经档案范围并集呈现两侧记录。
+
+        整个合并是单个事务：源档案状态、合并记录与两侧审计事件同生同灭，
+        失败时不留下半套迁移。相同参数的重复请求命中合并记录直接回放，
+        不会重复处理既有历史。
+        """
         reason = text(reason, "合并原因", maximum=600)
         if source_id == target_id:
             raise ValidationError("不能将患者合并到自身")
@@ -255,19 +263,48 @@ class Careflow:
             target = connection.execute("SELECT * FROM patients WHERE id=? AND clinic_id=?", (target_id, clinic_id)).fetchone()
             if source is None or target is None:
                 raise NotFound("患者不存在")
+            existing = connection.execute(
+                "SELECT * FROM patient_merges WHERE clinic_id=? AND source_id=?", (clinic_id, source_id)).fetchone()
+            if existing is not None:
+                if existing["target_id"] != target_id:
+                    raise Conflict("该档案已合并到其他保留档案", details={"merged_into": existing["target_id"]})
+                if (existing["reason"] != reason or existing["source_version"] != expected_source
+                        or existing["target_version"] != expected_target):
+                    raise Conflict("该档案已完成合并；重复请求的参数与原始合并不一致")
+                return {"source_id": source_id, "target_id": target_id, "state": "merged",
+                        "merged_at": existing["created_at"], "replayed": True}
+            if source["state"] == "merged":
+                # 兼容合并记录表建立前的数据：同一对档案直接返回归并结果。
+                if source["merged_into"] == target_id:
+                    return {"source_id": source_id, "target_id": target_id, "state": "merged",
+                            "merged_at": source["updated_at"], "replayed": True}
+                raise Conflict("该档案已合并到其他保留档案", details={"merged_into": source["merged_into"]})
             require_match(source["version"], expected_source, "源患者")
             require_match(target["version"], expected_target, "目标患者")
             if source["state"] != "active" or target["state"] != "active":
                 raise Conflict("只有在诊患者可以合并")
             if connection.execute("SELECT 1 FROM patients WHERE merged_into=?", (source_id,)).fetchone():
                 raise Conflict("该患者已作为其他合并记录的目标")
-            connection.execute("UPDATE patients SET state='merged',merged_into=?,updated_at=?,version=version+1 WHERE id=?",
-                               (target_id, now, source_id))
+            merge_id = new_id("mrg")
+            changed = connection.execute(
+                "UPDATE patients SET state='merged',merged_into=?,updated_at=?,version=version+1 "
+                "WHERE id=? AND version=? AND state='active'",
+                (target_id, now, source_id, expected_source)).rowcount
+            if changed != 1:
+                # 两个档案可能同时被修改；条件更新落空即整体回滚。
+                raise Conflict("源患者已被其他操作更新", details={"expected_version": expected_source})
+            connection.execute(
+                "INSERT INTO patient_merges(id,clinic_id,source_id,target_id,reason,actor_id,source_version,target_version,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (merge_id, clinic_id, source_id, target_id, reason, actor_id, expected_source, expected_target, now))
+            audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=source_id,
+                               aggregate_type="patient", aggregate_id=source_id, action="patient.merged_away",
+                               occurred_at=now, payload={"merge_id": merge_id, "target_id": target_id, "reason": reason})
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=target_id,
                                aggregate_type="patient", aggregate_id=target_id, action="patient.merged",
-                               occurred_at=now, payload={"source_id": source_id, "reason": reason,
-                                                         "source_version": source["version"], "target_version": target["version"]})
-        return {"source_id": source_id, "target_id": target_id, "state": "merged", "merged_at": now}
+                               occurred_at=now, payload={"merge_id": merge_id, "source_id": source_id, "reason": reason,
+                                                         "source_version": expected_source, "target_version": expected_target})
+        return {"source_id": source_id, "target_id": target_id, "state": "merged", "merged_at": now, "replayed": False}
 
     def grant_consent(self, clinic_id: str, actor_id: str, patient_id: str, purpose: str,
                       revision: int, text_digest: str, *, expires_at: str | None = None) -> dict[str, Any]:
@@ -289,8 +326,10 @@ class Careflow:
                 raise NotFound("患者不存在")
             if patient["state"] != "active":
                 raise Conflict("已合并或关闭的患者不能签署新授权")
+            scope = archives.scope_ids(connection, clinic_id, patient_id)
             previous = connection.execute(
-                "SELECT * FROM consents WHERE patient_id=? AND purpose=? ORDER BY revision DESC LIMIT 1", (patient_id, purpose)
+                f"SELECT * FROM consents WHERE patient_id IN ({archives.placeholders(len(scope))}) AND purpose=? "
+                "ORDER BY revision DESC LIMIT 1", (*scope, purpose)
             ).fetchone()
             if previous and revision <= previous["revision"]:
                 raise Conflict("新授权版本必须高于当前版本")
@@ -333,8 +372,8 @@ class Careflow:
         if not dependent_kind:
             return 0
         rows = connection.execute(
-            "SELECT * FROM plans WHERE patient_id=? AND kind=? AND state IN ('proposed','active') AND consent_id=?",
-            (consent["patient_id"], dependent_kind, consent["id"])).fetchall()
+            "SELECT * FROM plans WHERE consent_id=? AND kind=? AND state IN ('proposed','active')",
+            (consent["id"], dependent_kind)).fetchall()
         for plan in rows:
             connection.execute("UPDATE plans SET state='paused',updated_at=?,version=version+1 WHERE id=?", (now, plan["id"]))
             self._record_plan_revision(connection, plan["id"], plan["version"] + 1, actor_id, "关联授权已撤回", now)
@@ -348,10 +387,16 @@ class Careflow:
             authorize(principal_for(connection, actor_id, clinic_id), "consent:read", clinic_id=clinic_id)
             if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
                 raise NotFound("患者不存在")
+            scope = archives.scope_ids(connection, clinic_id, patient_id)
+            marks = archives.placeholders(len(scope))
             if purpose:
-                rows = connection.execute("SELECT * FROM consents WHERE patient_id=? AND purpose=? ORDER BY revision", (patient_id, purpose)).fetchall()
+                rows = connection.execute(
+                    f"SELECT * FROM consents WHERE patient_id IN ({marks}) AND purpose=? ORDER BY purpose,revision,created_at",
+                    (*scope, purpose)).fetchall()
             else:
-                rows = connection.execute("SELECT * FROM consents WHERE patient_id=? ORDER BY purpose,revision", (patient_id,)).fetchall()
+                rows = connection.execute(
+                    f"SELECT * FROM consents WHERE patient_id IN ({marks}) ORDER BY purpose,revision,created_at",
+                    tuple(scope)).fetchall()
             return [dict(row) for row in rows]
 
     def create_assessment(self, clinic_id: str, actor_id: str, patient_id: str, kind: str,
@@ -416,14 +461,21 @@ class Careflow:
             authorize(principal_for(connection, actor_id, clinic_id), "clinical:read", clinic_id=clinic_id)
             if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
                 raise NotFound("患者不存在")
+            scope = archives.scope_ids(connection, clinic_id, patient_id)
+            marks = archives.placeholders(len(scope))
             if kind:
-                rows = connection.execute("SELECT * FROM assessments WHERE patient_id=? AND kind=? ORDER BY captured_at DESC", (patient_id, kind)).fetchall()
+                rows = connection.execute(
+                    f"SELECT * FROM assessments WHERE patient_id IN ({marks}) AND kind=? ORDER BY captured_at DESC,id",
+                    (*scope, kind)).fetchall()
             else:
-                rows = connection.execute("SELECT * FROM assessments WHERE patient_id=? ORDER BY captured_at DESC", (patient_id,)).fetchall()
+                rows = connection.execute(
+                    f"SELECT * FROM assessments WHERE patient_id IN ({marks}) ORDER BY captured_at DESC,id",
+                    tuple(scope)).fetchall()
             return [{"id": row["id"], "kind": row["kind"], "captured_at": row["captured_at"],
                      "captured_by": row["captured_by"], "measurements": decode_json(row["measurements_json"]),
                      "answers": decode_json(row["answers_json"]), "source": row["source"],
-                     "status": row["status"], "signed_at": row["signed_at"], "version": row["version"]} for row in rows]
+                     "status": row["status"], "signed_at": row["signed_at"], "version": row["version"],
+                     "origin_patient_id": row["patient_id"]} for row in rows]
 
     def create_plan(self, clinic_id: str, actor_id: str, patient_id: str, kind: str, clinical_owner: str,
                     goal: dict, risk: dict, start_date: str, *, target_date: str | None = None,
@@ -452,15 +504,19 @@ class Careflow:
                 raise Conflict("非在诊患者不能建立新计划")
             if owner is None or owner["role"] not in {"clinician", "owner"}:
                 raise ValidationError("临床负责人必须是有效的医生或负责人")
+            scope = archives.scope_ids(connection, clinic_id, patient_id)
+            marks = archives.placeholders(len(scope))
             if assessment_id:
-                assessment = connection.execute("SELECT * FROM assessments WHERE id=? AND patient_id=?", (assessment_id, patient_id)).fetchone()
+                assessment = connection.execute(
+                    f"SELECT * FROM assessments WHERE id=? AND patient_id IN ({marks})",
+                    (assessment_id, *scope)).fetchone()
                 if assessment is None or assessment["status"] != "signed":
                     raise Conflict("计划引用的评估不存在或尚未签署")
             required_purpose = {"aesthetic": "aesthetic_procedure", "weight": "weight_program"}.get(kind)
             if required_purpose:
                 consent = connection.execute(
-                    "SELECT * FROM consents WHERE id=? AND patient_id=? AND purpose=? AND state='granted'",
-                    (consent_id, patient_id, required_purpose)).fetchone() if consent_id else None
+                    f"SELECT * FROM consents WHERE id=? AND patient_id IN ({marks}) AND purpose=? AND state='granted'",
+                    (consent_id, *scope, required_purpose)).fetchone() if consent_id else None
                 if consent is None or (consent["expires_at"] and parsed_timestamp(consent["expires_at"]) <= parsed_timestamp(now)):
                     raise Conflict("计划需要当前有效的对应授权")
             connection.execute(
@@ -567,7 +623,8 @@ class Careflow:
                     raise Conflict("工作人员在该时段已有预约", details={"appointment_id": overlap["id"]})
             if plan_id:
                 plan = connection.execute("SELECT state,patient_id FROM plans WHERE id=? AND clinic_id=?", (plan_id, clinic_id)).fetchone()
-                if plan is None or plan["patient_id"] != patient_id or plan["state"] not in {"proposed", "active"}:
+                if plan is None or plan["patient_id"] not in archives.scope_ids(connection, clinic_id, patient_id) \
+                        or plan["state"] not in {"proposed", "active"}:
                     raise Conflict("预约关联的计划不存在或当前不可履约")
             connection.execute(
                 "INSERT INTO appointments(id,clinic_id,patient_id,plan_id,staff_id,kind,starts_at,ends_at,state,hold_expires_at,idempotency_key,created_by,created_at) "
@@ -769,8 +826,10 @@ class Careflow:
                 if existing["patient_id"] != patient_id or existing["due_at"] != due or existing["reason"] != reason:
                     raise Conflict("随访幂等编号已用于其他内容")
                 return self._followup_result(existing, replayed=True)
-            if plan_id and connection.execute("SELECT 1 FROM plans WHERE id=? AND patient_id=? AND clinic_id=?", (plan_id, patient_id, clinic_id)).fetchone() is None:
-                raise NotFound("诊疗计划不存在")
+            if plan_id:
+                plan = connection.execute("SELECT patient_id FROM plans WHERE id=? AND clinic_id=?", (plan_id, clinic_id)).fetchone()
+                if plan is None or plan["patient_id"] not in archives.scope_ids(connection, clinic_id, patient_id):
+                    raise NotFound("诊疗计划不存在")
             if assigned_to and connection.execute("SELECT 1 FROM staff WHERE id=? AND clinic_id=? AND active=1", (assigned_to, clinic_id)).fetchone() is None:
                 raise ValidationError("随访责任人不存在或已停用")
             connection.execute("INSERT INTO followups(id,patient_id,plan_id,due_at,channel,reason,state,assigned_to,idempotency_key,created_at) "
@@ -857,10 +916,15 @@ class Careflow:
                 raise NotFound("患者不存在")
             if patient["state"] != "active":
                 raise Conflict("非在诊患者不能添加观察值")
-            if plan_id and connection.execute("SELECT 1 FROM plans WHERE id=? AND patient_id=? AND clinic_id=?", (plan_id, patient_id, clinic_id)).fetchone() is None:
-                raise NotFound("诊疗计划不存在")
+            if plan_id:
+                plan = connection.execute("SELECT patient_id FROM plans WHERE id=? AND clinic_id=?", (plan_id, clinic_id)).fetchone()
+                if plan is None or plan["patient_id"] not in archives.scope_ids(connection, clinic_id, patient_id):
+                    raise NotFound("诊疗计划不存在")
             if correction_of:
-                original = connection.execute("SELECT * FROM observations WHERE id=? AND patient_id=?", (correction_of, patient_id)).fetchone()
+                scope = archives.scope_ids(connection, clinic_id, patient_id)
+                original = connection.execute(
+                    f"SELECT * FROM observations WHERE id=? AND patient_id IN ({archives.placeholders(len(scope))})",
+                    (correction_of, *scope)).fetchone()
                 if original is None or original["correction_of"] is not None:
                     raise Conflict("只能更正已有原始观察值，不能重复更正")
                 prior = connection.execute("SELECT 1 FROM observations WHERE correction_of=?", (correction_of,)).fetchone()
@@ -881,9 +945,13 @@ class Careflow:
             authorize(principal_for(connection, actor_id, clinic_id), "clinical:read", clinic_id=clinic_id)
             if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
                 raise NotFound("患者不存在")
-            rows = connection.execute("SELECT * FROM observations WHERE patient_id=? AND kind=? ORDER BY observed_at,id", (patient_id, kind)).fetchall()
+            scope = archives.scope_ids(connection, clinic_id, patient_id)
+            rows = connection.execute(
+                f"SELECT * FROM observations WHERE patient_id IN ({archives.placeholders(len(scope))}) AND kind=? "
+                "ORDER BY observed_at,id", (*scope, kind)).fetchall()
             return [{"id": row["id"], "value": row["value_num"], "unit": row["unit"], "observed_at": row["observed_at"],
-                     "provenance": row["provenance"], "correction_of": row["correction_of"]} for row in rows]
+                     "provenance": row["provenance"], "correction_of": row["correction_of"],
+                     "origin_patient_id": row["patient_id"]} for row in rows]
 
     def report_incident(self, clinic_id: str, actor_id: str, patient_id: str, category: str,
                         severity: str, onset_at: str, summary: str, key: str, *, plan_id: str | None = None,
@@ -904,10 +972,14 @@ class Careflow:
                 if existing["patient_id"] != patient_id or existing["category"] != category or existing["summary"] != summary:
                     raise Conflict("不良事件幂等编号已用于其他内容")
                 return self._incident_result(existing, replayed=True)
-            if plan_id and connection.execute("SELECT 1 FROM plans WHERE id=? AND patient_id=? AND clinic_id=?", (plan_id, patient_id, clinic_id)).fetchone() is None:
-                raise NotFound("诊疗计划不存在")
-            if encounter_id and connection.execute("SELECT 1 FROM encounters WHERE id=? AND patient_id=? AND clinic_id=?", (encounter_id, patient_id, clinic_id)).fetchone() is None:
-                raise NotFound("就诊记录不存在")
+            if plan_id:
+                plan = connection.execute("SELECT patient_id FROM plans WHERE id=? AND clinic_id=?", (plan_id, clinic_id)).fetchone()
+                if plan is None or plan["patient_id"] not in archives.scope_ids(connection, clinic_id, patient_id):
+                    raise NotFound("诊疗计划不存在")
+            if encounter_id:
+                encounter = connection.execute("SELECT patient_id FROM encounters WHERE id=? AND clinic_id=?", (encounter_id, clinic_id)).fetchone()
+                if encounter is None or encounter["patient_id"] not in archives.scope_ids(connection, clinic_id, patient_id):
+                    raise NotFound("就诊记录不存在")
             connection.execute(
                 "INSERT INTO incidents(id,patient_id,plan_id,encounter_id,severity,state,category,onset_at,reported_at,reported_by,summary,idempotency_key) "
                 "VALUES(?,?,?,?,?,'reported',?,?,?,?,?,?)",
@@ -982,9 +1054,10 @@ class Careflow:
                 authorize(principal, "audit:patient", clinic_id=clinic_id)
                 if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
                     raise NotFound("患者不存在")
-            else:
-                authorize(principal, "audit:read", clinic_id=clinic_id)
-            return audit.list_events(connection, clinic_id, patient_id=patient_id, after=after, limit=limit)
+                scope = archives.scope_ids(connection, clinic_id, patient_id)
+                return audit.list_events(connection, clinic_id, patient_ids=scope, after=after, limit=limit)
+            authorize(principal, "audit:read", clinic_id=clinic_id)
+            return audit.list_events(connection, clinic_id, after=after, limit=limit)
 
     def verify_audit(self, clinic_id: str, actor_id: str) -> dict[str, Any]:
         with self.db.transaction(write=False) as connection:
@@ -1015,9 +1088,12 @@ class Careflow:
         limit = max(1, min(limit, 300))
         with self.db.transaction(write=False) as connection:
             authorize(principal_for(connection, actor_id, clinic_id), "clinical:read", clinic_id=clinic_id)
-            patient = connection.execute("SELECT id,state FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone()
+            patient = connection.execute("SELECT * FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone()
             if patient is None:
                 raise NotFound("患者不存在")
-            events = audit.list_events(connection, clinic_id, patient_id=patient_id, limit=limit)
-            return {"patient_id": patient_id, "patient_state": patient["state"], "events": events,
+            scope = archives.scope_ids(connection, clinic_id, patient_id)
+            events = audit.list_events(connection, clinic_id, patient_ids=scope, limit=limit)
+            return {"patient_id": patient_id, "patient_state": patient["state"],
+                    "merged_into": archives.merge_outcome(connection, clinic_id, patient),
+                    "events": events,
                     "next_cursor": events[-1]["sequence"] if len(events) == limit else None}

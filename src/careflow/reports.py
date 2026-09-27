@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from . import archives
 from .errors import NotFound, ValidationError
 from .security import authorize, principal_for
 from .validation import calendar_date, timestamp
@@ -150,11 +151,12 @@ class ReportService:
             raise ValidationError("时间范围反转")
         with self.db.transaction(write=False) as connection:
             authorize(principal_for(connection, actor_id, clinic_id), "clinical:read", clinic_id=clinic_id)
-            patient = connection.execute("SELECT id,external_ref,state FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone()
+            patient = connection.execute("SELECT * FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone()
             if patient is None:
                 raise NotFound("患者不存在")
-            clauses = ["patient_id=?", "kind='weight_kg'"]
-            params = [patient_id]
+            scope = archives.scope_ids(connection, clinic_id, patient_id)
+            clauses = [f"patient_id IN ({archives.placeholders(len(scope))})", "kind='weight_kg'"]
+            params: list = list(scope)
             if start_at:
                 clauses.append("observed_at>=?")
                 params.append(start_at)
@@ -169,9 +171,10 @@ class ReportService:
             for row in effective:
                 values.append({"id": row["id"], "observed_at": row["observed_at"], "weight_kg": row["value_num"],
                                "recorded_by": row["recorded_by"], "provenance": row["provenance"],
-                               "corrects": row["correction_of"]})
+                               "corrects": row["correction_of"], "origin_patient_id": row["patient_id"]})
             delta = round(values[-1]["weight_kg"] - values[0]["weight_kg"], 2) if len(values) >= 2 else None
             return {"patient_id": patient_id, "patient_ref": patient["external_ref"], "patient_state": patient["state"],
+                    "merged_into": archives.merge_outcome(connection, clinic_id, patient),
                     "observations": values, "count": len(values), "first_to_last_delta_kg": delta,
                     "interpretation": "仅展示已记录测量，不构成诊断或治疗建议。"}
 
@@ -180,6 +183,14 @@ class ReportService:
             authorize(principal_for(connection, actor_id, clinic_id), "clinical:read", clinic_id=clinic_id)
             if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
                 raise NotFound("患者不存在")
-            rows = connection.execute("SELECT id,kind,state,start_date,target_date,updated_at,version FROM plans "
-                                      "WHERE patient_id=? AND clinic_id=? ORDER BY start_date,id", (patient_id, clinic_id)).fetchall()
-            return {"patient_id": patient_id, "plans": [dict(row) for row in rows]}
+            scope = archives.scope_ids(connection, clinic_id, patient_id)
+            rows = connection.execute(
+                f"SELECT id,kind,state,start_date,target_date,updated_at,version,patient_id FROM plans "
+                f"WHERE patient_id IN ({archives.placeholders(len(scope))}) AND clinic_id=? ORDER BY start_date,id",
+                (*scope, clinic_id)).fetchall()
+            plans = []
+            for row in rows:
+                item = dict(row)
+                item["origin_patient_id"] = item.pop("patient_id")
+                plans.append(item)
+            return {"patient_id": patient_id, "plans": plans}

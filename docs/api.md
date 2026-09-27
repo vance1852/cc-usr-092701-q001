@@ -11,8 +11,8 @@
 ## 患者、评估与诊疗计划
 
 - `POST /patients` 建立诊所内患者档案；外部编号在诊所范围内唯一。
-- `GET /patients/{patient_id}` 返回最小档案，不返回联系方式密文。
-- `POST /patients/{patient_id}/merge` 以两个版本号和书面原因将重复档案标记为合并，并指向保留档案。
+- `GET /patients/{patient_id}` 返回最小档案，不返回联系方式密文；已合并档案附带 `merged_into` 归并去向（目标编号、外部编号与合并时间），目标不属于本诊所时不返回去向。
+- `POST /patients/{patient_id}/merge` 以两个版本号和书面原因将重复档案标记为合并，并指向保留档案。合并不改写历史业务行：保留档案的评估、观察、计划、随访、就诊、授权与审计视图会并集呈现两侧记录，每条记录以 `origin_patient_id`（审计事件以 `patient_id`）标注原先所属档案编号。相同参数的重复合并请求返回首次结果（`replayed: true`），不重复处理既有历史；参数或目标不一致的重复请求返回冲突。合并在单个事务内完成，版本校验失败时不留下半套迁移。
 - `POST /patients/{patient_id}/assessments` 新建评估草稿；`POST /assessments/{assessment_id}/sign` 由临床岗位签署。
 - `POST /patients/{patient_id}/consents` 创建更高版本的授权；`POST /consents/{consent_id}/withdraw` 撤回授权。
 - `POST /patients/{patient_id}/plans` 建立计划，医美和体重管理计划必须引用当前对应授权。
@@ -41,7 +41,7 @@
 
 护理人员可报告事件或患者安全关注项；临床岗位复核并记录处置，诊所负责人可作废就诊记录。`GET /audit/verify` 校验诊所哈希链，`GET /audit/diagnostics` 汇报需人工核对的一致性问题，不自动修改业务状态。
 
-`POST /patients/{patient_id}/export` 只在存在有效数据导出授权时返回明确选择的章节。导出字段采用白名单，联系方式密文、凭据和内部合并字段不会导出；相同幂等请求得到相同内容摘要。`GET /reports/daily`、`appointments`、`incidents` 和 `overdue-milestones` 仅返回运营汇总或经岗位授权的工作队列。
+`POST /patients/{patient_id}/export` 只在存在有效数据导出授权时返回明确选择的章节。导出字段采用白名单，联系方式密文、凭据不会导出；合并后各章节记录附带 `origin_patient_id` 标注来源档案，患者主档的合并去向等内部字段不会导出；相同幂等请求得到相同内容摘要。`GET /reports/daily`、`appointments`、`incidents` 和 `overdue-milestones` 仅返回运营汇总或经岗位授权的工作队列。
 
 ## 主要状态
 

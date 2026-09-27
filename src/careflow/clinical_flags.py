@@ -1,5 +1,6 @@
 """患者安全关注项记录；系统不代替医生判断诊断或治疗方案。"""
 
+from . import archives
 from . import audit
 from .db import Database
 from .errors import Conflict, NotFound, ValidationError
@@ -74,19 +75,28 @@ class ClinicalFlagService:
             authorize(principal_for(connection, actor_id, clinic_id), "clinical:read", clinic_id=clinic_id)
             if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
                 raise NotFound("患者不存在")
+            scope = archives.scope_ids(connection, clinic_id, patient_id)
+            marks = archives.placeholders(len(scope))
             if include_resolved:
-                rows = connection.execute("SELECT * FROM clinical_flags WHERE patient_id=? ORDER BY effective_from,id", (patient_id,)).fetchall()
+                rows = connection.execute(f"SELECT * FROM clinical_flags WHERE patient_id IN ({marks}) ORDER BY effective_from,id",
+                                          tuple(scope)).fetchall()
             else:
-                rows = connection.execute("SELECT * FROM clinical_flags WHERE patient_id=? AND state!='resolved' ORDER BY effective_from,id", (patient_id,)).fetchall()
+                rows = connection.execute(f"SELECT * FROM clinical_flags WHERE patient_id IN ({marks}) AND state!='resolved' ORDER BY effective_from,id",
+                                          tuple(scope)).fetchall()
             return [{"id": row["id"], "category": row["category"], "severity": row["severity"],
                      "detail": row["detail"], "state": row["state"], "effective_from": row["effective_from"],
                      "effective_until": row["effective_until"], "reported_by": row["reported_by"],
                      "reviewed_by": row["reviewed_by"], "reviewed_at": row["reviewed_at"],
-                     "version": row["version"]} for row in rows]
+                     "version": row["version"], "origin_patient_id": row["patient_id"]} for row in rows]
 
     def blocking_flags(self, connection, patient_id: str, as_of: str) -> list[dict]:
-        rows = connection.execute("SELECT id,category,severity,state,effective_from,effective_until FROM clinical_flags "
-                                  "WHERE patient_id=? AND severity='stop' AND state IN ('reported','confirmed') "
-                                  "AND effective_from<=? AND (effective_until IS NULL OR effective_until>?) ORDER BY id",
-                                  (patient_id, as_of, as_of)).fetchall()
+        patient = connection.execute("SELECT clinic_id FROM patients WHERE id=?", (patient_id,)).fetchone()
+        if patient is None:
+            return []
+        scope = archives.scope_ids(connection, patient["clinic_id"], patient_id)
+        rows = connection.execute(
+            f"SELECT id,category,severity,state,effective_from,effective_until,patient_id FROM clinical_flags "
+            f"WHERE patient_id IN ({archives.placeholders(len(scope))}) AND severity='stop' AND state IN ('reported','confirmed') "
+            "AND effective_from<=? AND (effective_until IS NULL OR effective_until>?) ORDER BY id",
+            (*scope, as_of, as_of)).fetchall()
         return [dict(row) for row in rows]

@@ -11,7 +11,7 @@ from typing import Iterator
 
 from .errors import StorageFailure
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -68,6 +68,19 @@ CREATE TABLE IF NOT EXISTS patients (
     UNIQUE(clinic_id, external_ref)
 );
 CREATE INDEX IF NOT EXISTS patients_clinic_state ON patients(clinic_id,state,created_at);
+CREATE INDEX IF NOT EXISTS patients_merged_into ON patients(merged_into);
+CREATE TABLE IF NOT EXISTS patient_merges (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    source_id TEXT NOT NULL REFERENCES patients(id),
+    target_id TEXT NOT NULL REFERENCES patients(id),
+    reason TEXT NOT NULL,
+    actor_id TEXT NOT NULL REFERENCES staff(id),
+    source_version INTEGER NOT NULL,
+    target_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(clinic_id, source_id)
+);
 CREATE TABLE IF NOT EXISTS consents (
     id TEXT PRIMARY KEY,
     patient_id TEXT NOT NULL REFERENCES patients(id),

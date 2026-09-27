@@ -73,9 +73,18 @@ def verify_chain(connection, clinic_id: str) -> dict[str, Any]:
     return {"ok": True, "events_checked": len(rows), "head": previous}
 
 
-def list_events(connection, clinic_id: str, *, patient_id: str | None = None, after: int = 0, limit: int = 100):
+def list_events(connection, clinic_id: str, *, patient_id: str | None = None,
+                patient_ids: list[str] | None = None, after: int = 0, limit: int = 100):
     limit = max(1, min(limit, 500))
-    if patient_id:
+    if patient_ids is not None:
+        if not patient_ids:
+            return []
+        marks = ",".join("?" for _ in patient_ids)
+        rows = connection.execute(
+            f"SELECT * FROM audit_events WHERE clinic_id=? AND patient_id IN ({marks}) AND sequence>? ORDER BY sequence LIMIT ?",
+            (clinic_id, *patient_ids, after, limit),
+        ).fetchall()
+    elif patient_id:
         rows = connection.execute(
             "SELECT * FROM audit_events WHERE clinic_id=? AND patient_id=? AND sequence>? ORDER BY sequence LIMIT ?",
             (clinic_id, patient_id, after, limit),
