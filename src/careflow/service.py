@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 import hashlib
 import secrets
+import sqlite3
 from typing import Any
 
 from . import audit
@@ -12,6 +13,7 @@ from .clock import Clock, SystemClock
 from .db import Database, decode_json, encode_json
 from .errors import Conflict, Forbidden, NotFound, ValidationError
 from .ids import new_id, require_id, require_idempotency_key
+from .lineage import direct_merge_sources, merged_lineage, placeholders
 from .security import Principal, authorize, hash_token, principal_for, verify_token
 from .validation import (
     calendar_date,
@@ -238,6 +240,29 @@ class Careflow:
             result = {"id": row["id"], "clinic_id": row["clinic_id"], "external_ref": row["external_ref"],
                       "display_name": row["display_name"], "birth_date": row["birth_date"],
                       "state": row["state"], "version": row["version"], "created_at": row["created_at"]}
+            if row["state"] == "merged":
+                # 旧编号后续查询必须返回清楚的归并去向，而不是让临床团队误判为"从未有此档案"。
+                result["merged_into"] = row["merged_into"]
+                recorded = connection.execute(
+                    "SELECT * FROM patient_merges WHERE clinic_id=? AND source_id=?", (clinic_id, row["id"])).fetchone()
+                result["merge"] = {
+                    "target_id": row["merged_into"],
+                    "merge_id": recorded["id"] if recorded else None,
+                    "reason": recorded["reason"] if recorded else None,
+                    "merged_at": recorded["created_at"] if recorded else row["updated_at"],
+                    "merged_by": recorded["actor_id"] if recorded else None,
+                }
+                return result
+            sources = direct_merge_sources(connection, clinic_id, row["id"])
+            if sources:
+                source_rows = connection.execute(
+                    "SELECT p.id,p.external_ref,m.created_at AS merged_at,m.reason "
+                    "FROM patients p LEFT JOIN patient_merges m ON m.clinic_id=? AND m.source_id=p.id "
+                    "WHERE p.clinic_id=? AND p.id IN (" + placeholders(len(sources)) + ") ORDER BY p.id",
+                    (clinic_id, clinic_id, *sources)).fetchall()
+                result["merged_sources"] = [
+                    {"patient_id": item["id"], "external_ref": item["external_ref"],
+                     "merged_at": item["merged_at"], "reason": item["reason"]} for item in source_rows]
             if include_contact:
                 authorize(principal, "clinical:read", clinic_id=clinic_id)
                 result["phone_ciphertext"] = row["phone_ciphertext"]
@@ -245,6 +270,13 @@ class Careflow:
 
     def merge_patients(self, clinic_id: str, actor_id: str, source_id: str, target_id: str,
                        *, expected_source: int, expected_target: int, reason: str) -> dict[str, Any]:
+        """把重复档案并入保留档案。
+
+        合并不搬移业务数据行：源档案标记为已合并并指向保留档案，各表原始记录
+        仍挂在最初录入的档案编号下，读取侧经谱系展开呈现完整历史并保留溯源。
+        整个合并是单个事务：合并记录、源档案状态与双侧审计事件同生同灭；
+        同一来源档案重复提交合并返回首次结果，不重复处理既有历史。
+        """
         reason = text(reason, "合并原因", maximum=600)
         if source_id == target_id:
             raise ValidationError("不能将患者合并到自身")
@@ -255,19 +287,51 @@ class Careflow:
             target = connection.execute("SELECT * FROM patients WHERE id=? AND clinic_id=?", (target_id, clinic_id)).fetchone()
             if source is None or target is None:
                 raise NotFound("患者不存在")
+            recorded = connection.execute(
+                "SELECT * FROM patient_merges WHERE clinic_id=? AND source_id=?", (clinic_id, source_id)).fetchone()
+            if recorded is not None:
+                if recorded["target_id"] != target_id:
+                    raise Conflict("该患者档案已合并至其他保留档案",
+                                   details={"source_id": source_id})
+                return self._merge_result(recorded, replayed=True)
+            if source["state"] == "merged":
+                # 兼容建立合并登记前已归档的合并：按档案现状给出同样的归并结果。
+                if source["merged_into"] == target_id:
+                    return {"source_id": source_id, "target_id": target_id, "state": "merged",
+                            "merged_at": source["updated_at"], "merge_id": None, "replayed": True}
+                raise Conflict("该患者档案已合并至其他保留档案", details={"source_id": source_id})
             require_match(source["version"], expected_source, "源患者")
             require_match(target["version"], expected_target, "目标患者")
             if source["state"] != "active" or target["state"] != "active":
                 raise Conflict("只有在诊患者可以合并")
             if connection.execute("SELECT 1 FROM patients WHERE merged_into=?", (source_id,)).fetchone():
                 raise Conflict("该患者已作为其他合并记录的目标")
+            merge_id = new_id("mrg")
+            try:
+                connection.execute(
+                    "INSERT INTO patient_merges(id,clinic_id,source_id,target_id,reason,actor_id,source_version,target_version,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (merge_id, clinic_id, source_id, target_id, reason, actor_id,
+                     source["version"], target["version"], now))
+            except sqlite3.IntegrityError as exc:
+                # 并发合并的兜底：唯一约束保证同一来源只被登记一次。
+                raise Conflict("该患者档案已被其他合并请求处理", details={"source_id": source_id}) from exc
             connection.execute("UPDATE patients SET state='merged',merged_into=?,updated_at=?,version=version+1 WHERE id=?",
                                (target_id, now, source_id))
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=target_id,
                                aggregate_type="patient", aggregate_id=target_id, action="patient.merged",
-                               occurred_at=now, payload={"source_id": source_id, "reason": reason,
+                               occurred_at=now, payload={"source_id": source_id, "reason": reason, "merge_id": merge_id,
                                                          "source_version": source["version"], "target_version": target["version"]})
-        return {"source_id": source_id, "target_id": target_id, "state": "merged", "merged_at": now}
+            audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=source_id,
+                               aggregate_type="patient", aggregate_id=source_id, action="patient.merged_away",
+                               occurred_at=now, payload={"target_id": target_id, "reason": reason, "merge_id": merge_id})
+            recorded = connection.execute("SELECT * FROM patient_merges WHERE id=?", (merge_id,)).fetchone()
+        return self._merge_result(recorded, replayed=False)
+
+    @staticmethod
+    def _merge_result(merge, *, replayed: bool) -> dict[str, Any]:
+        return {"source_id": merge["source_id"], "target_id": merge["target_id"], "state": "merged",
+                "merged_at": merge["created_at"], "merge_id": merge["id"], "replayed": replayed}
 
     def grant_consent(self, clinic_id: str, actor_id: str, patient_id: str, purpose: str,
                       revision: int, text_digest: str, *, expires_at: str | None = None) -> dict[str, Any]:
@@ -346,12 +410,18 @@ class Careflow:
     def consent_history(self, clinic_id: str, actor_id: str, patient_id: str, purpose: str | None = None) -> list[dict[str, Any]]:
         with self.db.transaction(write=False) as connection:
             authorize(principal_for(connection, actor_id, clinic_id), "consent:read", clinic_id=clinic_id)
-            if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
+            lineage = merged_lineage(connection, clinic_id, patient_id)
+            if not lineage:
                 raise NotFound("患者不存在")
+            marks = placeholders(len(lineage))
             if purpose:
-                rows = connection.execute("SELECT * FROM consents WHERE patient_id=? AND purpose=? ORDER BY revision", (patient_id, purpose)).fetchall()
+                rows = connection.execute(
+                    f"SELECT * FROM consents WHERE patient_id IN ({marks}) AND purpose=? ORDER BY revision",
+                    (*lineage, purpose)).fetchall()
             else:
-                rows = connection.execute("SELECT * FROM consents WHERE patient_id=? ORDER BY purpose,revision", (patient_id,)).fetchall()
+                rows = connection.execute(
+                    f"SELECT * FROM consents WHERE patient_id IN ({marks}) ORDER BY patient_id,purpose,revision",
+                    lineage).fetchall()
             return [dict(row) for row in rows]
 
     def create_assessment(self, clinic_id: str, actor_id: str, patient_id: str, kind: str,
@@ -414,13 +484,19 @@ class Careflow:
     def list_assessments(self, clinic_id: str, actor_id: str, patient_id: str, *, kind: str | None = None) -> list[dict[str, Any]]:
         with self.db.transaction(write=False) as connection:
             authorize(principal_for(connection, actor_id, clinic_id), "clinical:read", clinic_id=clinic_id)
-            if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
+            lineage = merged_lineage(connection, clinic_id, patient_id)
+            if not lineage:
                 raise NotFound("患者不存在")
+            marks = placeholders(len(lineage))
             if kind:
-                rows = connection.execute("SELECT * FROM assessments WHERE patient_id=? AND kind=? ORDER BY captured_at DESC", (patient_id, kind)).fetchall()
+                rows = connection.execute(
+                    f"SELECT * FROM assessments WHERE patient_id IN ({marks}) AND kind=? ORDER BY captured_at DESC,id",
+                    (*lineage, kind)).fetchall()
             else:
-                rows = connection.execute("SELECT * FROM assessments WHERE patient_id=? ORDER BY captured_at DESC", (patient_id,)).fetchall()
-            return [{"id": row["id"], "kind": row["kind"], "captured_at": row["captured_at"],
+                rows = connection.execute(
+                    f"SELECT * FROM assessments WHERE patient_id IN ({marks}) ORDER BY captured_at DESC,id",
+                    lineage).fetchall()
+            return [{"id": row["id"], "patient_id": row["patient_id"], "kind": row["kind"], "captured_at": row["captured_at"],
                      "captured_by": row["captured_by"], "measurements": decode_json(row["measurements_json"]),
                      "answers": decode_json(row["answers_json"]), "source": row["source"],
                      "status": row["status"], "signed_at": row["signed_at"], "version": row["version"]} for row in rows]
@@ -879,11 +955,16 @@ class Careflow:
         kind = choice(kind, "观察类型", {"weight_kg", "waist_cm", "symptom_score", "satisfaction", "blood_pressure"})
         with self.db.transaction(write=False) as connection:
             authorize(principal_for(connection, actor_id, clinic_id), "clinical:read", clinic_id=clinic_id)
-            if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
+            lineage = merged_lineage(connection, clinic_id, patient_id)
+            if not lineage:
                 raise NotFound("患者不存在")
-            rows = connection.execute("SELECT * FROM observations WHERE patient_id=? AND kind=? ORDER BY observed_at,id", (patient_id, kind)).fetchall()
-            return [{"id": row["id"], "value": row["value_num"], "unit": row["unit"], "observed_at": row["observed_at"],
-                     "provenance": row["provenance"], "correction_of": row["correction_of"]} for row in rows]
+            marks = placeholders(len(lineage))
+            rows = connection.execute(
+                f"SELECT * FROM observations WHERE patient_id IN ({marks}) AND kind=? ORDER BY observed_at,id",
+                (*lineage, kind)).fetchall()
+            return [{"id": row["id"], "patient_id": row["patient_id"], "value": row["value_num"], "unit": row["unit"],
+                     "observed_at": row["observed_at"], "provenance": row["provenance"],
+                     "correction_of": row["correction_of"]} for row in rows]
 
     def report_incident(self, clinic_id: str, actor_id: str, patient_id: str, category: str,
                         severity: str, onset_at: str, summary: str, key: str, *, plan_id: str | None = None,
@@ -980,11 +1061,12 @@ class Careflow:
             principal = principal_for(connection, actor_id, clinic_id)
             if patient_id:
                 authorize(principal, "audit:patient", clinic_id=clinic_id)
-                if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
+                lineage = merged_lineage(connection, clinic_id, patient_id)
+                if not lineage:
                     raise NotFound("患者不存在")
-            else:
-                authorize(principal, "audit:read", clinic_id=clinic_id)
-            return audit.list_events(connection, clinic_id, patient_id=patient_id, after=after, limit=limit)
+                return audit.list_events(connection, clinic_id, patient_ids=lineage, after=after, limit=limit)
+            authorize(principal, "audit:read", clinic_id=clinic_id)
+            return audit.list_events(connection, clinic_id, after=after, limit=limit)
 
     def verify_audit(self, clinic_id: str, actor_id: str) -> dict[str, Any]:
         with self.db.transaction(write=False) as connection:
@@ -1015,9 +1097,19 @@ class Careflow:
         limit = max(1, min(limit, 300))
         with self.db.transaction(write=False) as connection:
             authorize(principal_for(connection, actor_id, clinic_id), "clinical:read", clinic_id=clinic_id)
-            patient = connection.execute("SELECT id,state FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone()
+            patient = connection.execute("SELECT id,state,merged_into FROM patients WHERE id=? AND clinic_id=?",
+                                         (patient_id, clinic_id)).fetchone()
             if patient is None:
                 raise NotFound("患者不存在")
-            events = audit.list_events(connection, clinic_id, patient_id=patient_id, limit=limit)
-            return {"patient_id": patient_id, "patient_state": patient["state"], "events": events,
-                    "next_cursor": events[-1]["sequence"] if len(events) == limit else None}
+            # 保留档案的时间线必须包含已并入来源档案的事件；每条事件自带的
+            # patient_id 即原始档案编号，临床团队可追溯记录来自哪一侧。
+            lineage = merged_lineage(connection, clinic_id, patient_id)
+            events = audit.list_events(connection, clinic_id, patient_ids=lineage, limit=limit)
+            result = {"patient_id": patient_id, "patient_state": patient["state"], "events": events,
+                      "next_cursor": events[-1]["sequence"] if len(events) == limit else None}
+            if patient["state"] == "merged":
+                result["merged_into"] = patient["merged_into"]
+            sources = [item for item in lineage if item != patient_id]
+            if sources:
+                result["merged_from"] = sorted(sources)
+            return result

@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from .errors import NotFound, ValidationError
+from .lineage import merged_lineage, placeholders
 from .security import authorize, principal_for
 from .validation import calendar_date, timestamp
 
@@ -153,8 +154,10 @@ class ReportService:
             patient = connection.execute("SELECT id,external_ref,state FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone()
             if patient is None:
                 raise NotFound("患者不存在")
-            clauses = ["patient_id=?", "kind='weight_kg'"]
-            params = [patient_id]
+            # 已并入来源档案的测量一并呈现，patient_id 标注每条记录最初的档案编号。
+            lineage = merged_lineage(connection, clinic_id, patient_id)
+            clauses = ["patient_id IN (" + placeholders(len(lineage)) + ")", "kind='weight_kg'"]
+            params: list = [*lineage]
             if start_at:
                 clauses.append("observed_at>=?")
                 params.append(start_at)
@@ -167,19 +170,26 @@ class ReportService:
             effective.sort(key=lambda row: (row["observed_at"], row["id"]))
             values = []
             for row in effective:
-                values.append({"id": row["id"], "observed_at": row["observed_at"], "weight_kg": row["value_num"],
-                               "recorded_by": row["recorded_by"], "provenance": row["provenance"],
-                               "corrects": row["correction_of"]})
+                values.append({"id": row["id"], "patient_id": row["patient_id"], "observed_at": row["observed_at"],
+                               "weight_kg": row["value_num"], "recorded_by": row["recorded_by"],
+                               "provenance": row["provenance"], "corrects": row["correction_of"]})
             delta = round(values[-1]["weight_kg"] - values[0]["weight_kg"], 2) if len(values) >= 2 else None
-            return {"patient_id": patient_id, "patient_ref": patient["external_ref"], "patient_state": patient["state"],
-                    "observations": values, "count": len(values), "first_to_last_delta_kg": delta,
-                    "interpretation": "仅展示已记录测量，不构成诊断或治疗建议。"}
+            result = {"patient_id": patient_id, "patient_ref": patient["external_ref"], "patient_state": patient["state"],
+                      "observations": values, "count": len(values), "first_to_last_delta_kg": delta,
+                      "interpretation": "仅展示已记录测量，不构成诊断或治疗建议。"}
+            sources = [item for item in lineage if item != patient_id]
+            if sources:
+                result["merged_from"] = sorted(sources)
+            return result
 
     def plan_history(self, clinic_id: str, actor_id: str, patient_id: str) -> dict:
         with self.db.transaction(write=False) as connection:
             authorize(principal_for(connection, actor_id, clinic_id), "clinical:read", clinic_id=clinic_id)
-            if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
+            lineage = merged_lineage(connection, clinic_id, patient_id)
+            if not lineage:
                 raise NotFound("患者不存在")
-            rows = connection.execute("SELECT id,kind,state,start_date,target_date,updated_at,version FROM plans "
-                                      "WHERE patient_id=? AND clinic_id=? ORDER BY start_date,id", (patient_id, clinic_id)).fetchall()
+            rows = connection.execute(
+                "SELECT id,patient_id,kind,state,start_date,target_date,updated_at,version FROM plans "
+                "WHERE patient_id IN (" + placeholders(len(lineage)) + ") AND clinic_id=? ORDER BY start_date,id",
+                (*lineage, clinic_id)).fetchall()
             return {"patient_id": patient_id, "plans": [dict(row) for row in rows]}

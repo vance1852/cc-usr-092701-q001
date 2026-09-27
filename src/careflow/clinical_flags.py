@@ -4,6 +4,7 @@ from . import audit
 from .db import Database
 from .errors import Conflict, NotFound, ValidationError
 from .ids import new_id
+from .lineage import merged_lineage
 from .security import authorize, principal_for
 from .validation import choice, require_match, text, timestamp
 
@@ -72,13 +73,16 @@ class ClinicalFlagService:
     def list_for_patient(self, clinic_id: str, actor_id: str, patient_id: str, *, include_resolved: bool = False) -> list[dict]:
         with self.db.transaction(write=False) as connection:
             authorize(principal_for(connection, actor_id, clinic_id), "clinical:read", clinic_id=clinic_id)
-            if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
+            lineage = merged_lineage(connection, clinic_id, patient_id)
+            if not lineage:
                 raise NotFound("患者不存在")
+            # 安全关注项不因档案合并而隐身；patient_id 标明最初记录于哪个档案。
+            marks = ",".join("?" for _ in lineage)
             if include_resolved:
-                rows = connection.execute("SELECT * FROM clinical_flags WHERE patient_id=? ORDER BY effective_from,id", (patient_id,)).fetchall()
+                rows = connection.execute(f"SELECT * FROM clinical_flags WHERE patient_id IN ({marks}) ORDER BY effective_from,id", lineage).fetchall()
             else:
-                rows = connection.execute("SELECT * FROM clinical_flags WHERE patient_id=? AND state!='resolved' ORDER BY effective_from,id", (patient_id,)).fetchall()
-            return [{"id": row["id"], "category": row["category"], "severity": row["severity"],
+                rows = connection.execute(f"SELECT * FROM clinical_flags WHERE patient_id IN ({marks}) AND state!='resolved' ORDER BY effective_from,id", lineage).fetchall()
+            return [{"id": row["id"], "patient_id": row["patient_id"], "category": row["category"], "severity": row["severity"],
                      "detail": row["detail"], "state": row["state"], "effective_from": row["effective_from"],
                      "effective_until": row["effective_until"], "reported_by": row["reported_by"],
                      "reviewed_by": row["reviewed_by"], "reviewed_at": row["reviewed_at"],

@@ -248,6 +248,200 @@ class CareflowCase(unittest.TestCase):
         self.assertTrue(replay["replayed"])
         self.assertNotIn("phone_ciphertext", json.dumps(first, ensure_ascii=False))
 
+    def duplicate_patient(self, ref="case-017-dup"):
+        """前台用第二个证件编号为同一位患者建立的重复档案。"""
+        return self.app.create_patient(self.clinic, self.coordinator, ref, "林女士")
+
+    def test_merge_preserves_history_visibility_with_provenance(self):
+        source = self.duplicate_patient()
+        # 护士把第一次体重测量记在了旧档案里，旧档案还有评估、授权、随访与安全关注项。
+        first_weight = self.app.record_observation(self.clinic, self.nurse, source["id"], "weight_kg", 74.6,
+                                                   "2026-09-26T09:30:00+08:00")
+        assessment = self.app.create_assessment(self.clinic, self.clinician, source["id"], "weight",
+                                                {"weight_kg": "74.6"}, {"sleep": "一般"})
+        self.app.sign_assessment(self.clinic, self.clinician, assessment["id"], expected_version=1)
+        digest = hashlib.sha256(b"weight_program-r1").hexdigest()
+        self.app.grant_consent(self.clinic, self.clinician, source["id"], "weight_program", 1, digest)
+        self.app.schedule_followup(self.clinic, self.clinician, source["id"],
+                                   "2026-09-27T13:00:00Z", "首次复诊提醒", "fup-dup-1")
+        self.app.clinical_flags.report(self.clinic, self.nurse, source["id"], "allergy", "caution", "青霉素过敏史")
+        self.app.record_observation(self.clinic, self.clinician, self.patient["id"], "weight_kg", 74.1,
+                                    "2026-09-27T08:00:00+08:00")
+        before = self.app.patient_timeline(self.clinic, self.clinician, self.patient["id"])
+        self.assertNotIn(first_weight["id"], json.dumps(before))
+
+        result = self.app.merge_patients(self.clinic, self.owner, source["id"], self.patient["id"],
+                                         expected_source=1, expected_target=1, reason="同一患者两个证件编号")
+        self.assertEqual(result["state"], "merged")
+        self.assertFalse(result["replayed"])
+        self.assertTrue(result["merge_id"])
+
+        # 保留档案时间线可见两侧事件，且每条事件保留最初所属档案编号。
+        timeline = self.app.patient_timeline(self.clinic, self.clinician, self.patient["id"])
+        self.assertEqual(timeline["merged_from"], [source["id"]])
+        by_action = {}
+        for event in timeline["events"]:
+            by_action.setdefault(event["action"], []).append(event)
+        self.assertEqual(by_action["observation.recorded"][0]["patient_id"], source["id"])
+        self.assertEqual(by_action["assessment.created"][0]["patient_id"], source["id"])
+        self.assertEqual(by_action["followup.scheduled"][0]["patient_id"], source["id"])
+        self.assertEqual(by_action["patient.merged"][0]["payload"]["source_id"], source["id"])
+        # 第一次体重测量进入保留档案的测量序列，并标注来自旧档案。
+        series = self.app.reports.weight_series(self.clinic, self.clinician, self.patient["id"])
+        self.assertEqual(series["merged_from"], [source["id"]])
+        self.assertEqual([row["weight_kg"] for row in series["observations"]], [74.6, 74.1])
+        self.assertEqual(series["observations"][0]["patient_id"], source["id"])
+        observations = self.app.observation_series(self.clinic, self.clinician, self.patient["id"], "weight_kg")
+        self.assertEqual({row["patient_id"] for row in observations}, {source["id"], self.patient["id"]})
+        # 评估、授权、安全关注项同样可从保留档案追溯。
+        assessments = self.app.list_assessments(self.clinic, self.clinician, self.patient["id"])
+        self.assertEqual(assessments[0]["patient_id"], source["id"])
+        self.assertEqual(assessments[0]["status"], "signed")
+        consents = self.app.consent_history(self.clinic, self.clinician, self.patient["id"])
+        self.assertEqual({row["patient_id"] for row in consents}, {source["id"]})
+        flags = self.app.clinical_flags.list_for_patient(self.clinic, self.clinician, self.patient["id"])
+        self.assertEqual(flags[0]["patient_id"], source["id"])
+        # 导出保留档案时两侧记录都在，且带有原始档案编号。
+        self.consent("data_export")
+        exported = self.app.exports.export(self.clinic, self.owner, self.patient["id"],
+                                           ["observations", "assessments"], "患者本人申请", "export-merge-1")
+        self.assertEqual(exported["data"]["merged_from"], [source["id"]])
+        self.assertEqual({row["patient_id"] for row in exported["data"]["observations"]},
+                         {source["id"], self.patient["id"]})
+        self.assertEqual(exported["data"]["assessments"][0]["patient_id"], source["id"])
+
+    def test_merged_source_queries_return_clear_result_without_leakage(self):
+        source = self.duplicate_patient()
+        merged = self.app.merge_patients(self.clinic, self.owner, source["id"], self.patient["id"],
+                                         expected_source=1, expected_target=1, reason="重复建档")
+        # 旧编号查询返回清楚的归并结果。
+        retired = self.app.get_patient(self.clinic, self.coordinator, source["id"])
+        self.assertEqual(retired["state"], "merged")
+        self.assertEqual(retired["merged_into"], self.patient["id"])
+        self.assertEqual(retired["merge"]["merge_id"], merged["merge_id"])
+        self.assertEqual(retired["merge"]["reason"], "重复建档")
+        self.assertEqual(retired["merge"]["merged_at"], merged["merged_at"])
+        # 保留档案能看到并入了哪些旧编号。
+        kept = self.app.get_patient(self.clinic, self.coordinator, self.patient["id"])
+        self.assertEqual([item["patient_id"] for item in kept["merged_sources"]], [source["id"]])
+        self.assertEqual(kept["merged_sources"][0]["external_ref"], "case-017-dup")
+        # 旧编号时间线保留自身历史并标明去向。
+        timeline = self.app.patient_timeline(self.clinic, self.clinician, source["id"])
+        self.assertEqual(timeline["patient_state"], "merged")
+        self.assertEqual(timeline["merged_into"], self.patient["id"])
+        self.assertIn("patient.merged_away", {event["action"] for event in timeline["events"]})
+        # 另一诊所查询该旧编号只得到"不存在"，不泄露归并去向。
+        other = self.app.create_clinic("另一诊所", "UTC")
+        outsider = self.app.create_staff(other["id"], "负责人", "owner")
+        with self.assertRaises(NotFound):
+            self.app.get_patient(other["id"], outsider["id"], source["id"])
+        with self.assertRaises(NotFound):
+            self.app.patient_timeline(other["id"], outsider["id"], source["id"])
+
+    def test_merge_is_atomic_and_replay_does_not_reprocess_history(self):
+        source = self.duplicate_patient()
+        self.app.record_observation(self.clinic, self.nurse, source["id"], "weight_kg", 74.6,
+                                    "2026-09-26T09:30:00+08:00")
+        events_before = len(self.app.audit_history(self.clinic, self.owner))
+        # 版本号过期（并发修改）导致合并失败：不留任何半套迁移。
+        with self.assertRaises(Conflict):
+            self.app.merge_patients(self.clinic, self.owner, source["id"], self.patient["id"],
+                                    expected_source=9, expected_target=1, reason="重复建档")
+        self.assertEqual(self.app.get_patient(self.clinic, self.owner, source["id"])["state"], "active")
+        self.assertEqual(len(self.app.audit_history(self.clinic, self.owner)), events_before)
+        with self.db.transaction(write=False) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM patient_merges").fetchone()[0], 0)
+        # 正常合并后，同一请求重复提交返回首次结果，不重复处理既有历史。
+        first = self.app.merge_patients(self.clinic, self.owner, source["id"], self.patient["id"],
+                                        expected_source=1, expected_target=1, reason="重复建档")
+        events_after_merge = len(self.app.audit_history(self.clinic, self.owner))
+        replay = self.app.merge_patients(self.clinic, self.owner, source["id"], self.patient["id"],
+                                         expected_source=1, expected_target=1, reason="重复建档")
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["merge_id"], first["merge_id"])
+        self.assertEqual(replay["merged_at"], first["merged_at"])
+        self.assertEqual(len(self.app.audit_history(self.clinic, self.owner)), events_after_merge)
+        with self.db.transaction(write=False) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM patient_merges").fetchone()[0], 1)
+        # 同一旧档案不能再并入其他保留档案，也不能反向合并。
+        third = self.duplicate_patient("case-017-tri")
+        with self.assertRaises(Conflict):
+            self.app.merge_patients(self.clinic, self.owner, source["id"], third["id"],
+                                    expected_source=2, expected_target=1, reason="改并入新档案")
+        with self.assertRaises(Conflict):
+            self.app.merge_patients(self.clinic, self.owner, self.patient["id"], source["id"],
+                                    expected_source=1, expected_target=2, reason="反向合并")
+
+    def test_concurrent_merge_requests_settle_exactly_once(self):
+        source = self.duplicate_patient()
+        results, errors = [], []
+
+        def merge():
+            try:
+                results.append(self.app.merge_patients(self.clinic, self.owner, source["id"], self.patient["id"],
+                                                       expected_source=1, expected_target=1, reason="重复建档"))
+            except Exception as exc:  # noqa: BLE001 - 测试中收集并发结果
+                errors.append(exc)
+
+        threads = [threading.Thread(target=merge) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sum(1 for item in results if not item["replayed"]), 1)
+        self.assertEqual(sum(1 for item in results if item["replayed"]), 1)
+        self.assertEqual({item["merge_id"] for item in results}, {results[0]["merge_id"]})
+        with self.db.transaction(write=False) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM patient_merges").fetchone()[0], 1)
+        self.assertEqual(self.app.get_patient(self.clinic, self.owner, source["id"])["version"], 2)
+
+    def test_merged_source_rejects_new_writes_but_stays_readable(self):
+        source = self.duplicate_patient()
+        assessment = self.app.create_assessment(self.clinic, self.clinician, source["id"], "weight",
+                                                {"weight_kg": "74.6"}, {})
+        self.app.merge_patients(self.clinic, self.owner, source["id"], self.patient["id"],
+                                expected_source=1, expected_target=1, reason="重复建档")
+        # 旧档案不再接受新记录，新数据只能写到保留档案。
+        with self.assertRaises(Conflict):
+            self.app.record_observation(self.clinic, self.nurse, source["id"], "weight_kg", 74.0,
+                                        "2026-09-27T09:00:00+08:00")
+        with self.assertRaises(Conflict):
+            self.app.create_assessment(self.clinic, self.clinician, source["id"], "weight", {}, {})
+        with self.assertRaises(Conflict):
+            self.app.schedule_followup(self.clinic, self.clinician, source["id"],
+                                       "2026-09-28T13:00:00Z", "随访", "fup-dup-2")
+        with self.assertRaises(Conflict):
+            self.app.grant_consent(self.clinic, self.clinician, source["id"], "weight_program", 1, "b" * 64)
+        # 旧档案自身历史仍然可读，且只呈现它自己的记录。
+        own = self.app.list_assessments(self.clinic, self.clinician, source["id"])
+        self.assertEqual([row["id"] for row in own], [assessment["id"]])
+        series = self.app.reports.weight_series(self.clinic, self.clinician, source["id"])
+        self.assertEqual(series["patient_state"], "merged")
+        self.assertNotIn("merged_from", series)
+
+    def test_legacy_merged_patient_gains_lineage_reads_and_replay(self):
+        # 模拟本次修复前已合并的档案：只有 patients 行被标记，没有合并登记。
+        source = self.duplicate_patient()
+        self.app.record_observation(self.clinic, self.nurse, source["id"], "weight_kg", 74.6,
+                                    "2026-09-26T09:30:00+08:00")
+        with self.db.transaction() as connection:
+            connection.execute("UPDATE patients SET state='merged',merged_into=?,updated_at=?,version=version+1 WHERE id=?",
+                               (self.patient["id"], self.app.now(), source["id"]))
+        retired = self.app.get_patient(self.clinic, self.coordinator, source["id"])
+        self.assertEqual(retired["merged_into"], self.patient["id"])
+        self.assertIsNone(retired["merge"]["merge_id"])
+        series = self.app.reports.weight_series(self.clinic, self.clinician, self.patient["id"])
+        self.assertEqual([row["weight_kg"] for row in series["observations"]], [74.6])
+        replay = self.app.merge_patients(self.clinic, self.owner, source["id"], self.patient["id"],
+                                         expected_source=2, expected_target=1, reason="补登记")
+        self.assertTrue(replay["replayed"])
+        third = self.duplicate_patient("case-017-tri")
+        with self.assertRaises(Conflict):
+            self.app.merge_patients(self.clinic, self.owner, source["id"], third["id"],
+                                    expected_source=2, expected_target=1, reason="改并入新档案")
+
     def test_daily_report_uses_clinic_calendar_day_and_dst_aware_bounds(self):
         clinic = self.app.create_clinic("北美诊所", "America/New_York")
         owner = self.app.create_staff(clinic["id"], "负责人", "owner")

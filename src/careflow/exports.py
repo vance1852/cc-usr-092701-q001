@@ -9,6 +9,7 @@ from . import audit
 from .db import Database, decode_json, encode_json
 from .errors import Conflict, NotFound, ValidationError
 from .ids import new_id
+from .lineage import merged_lineage
 from .security import authorize, principal_for
 from .validation import choice, parsed_timestamp, text, timestamp
 
@@ -54,10 +55,14 @@ class PatientExportService:
                 raise Conflict("患者没有当前有效的数据导出授权")
             if any(item != "profile" for item in selected):
                 authorize(principal, "clinical:read", clinic_id=clinic_id)
+            # 已并入来源档案的记录随保留档案一并导出，patient_id 标明原始档案编号。
+            lineage = merged_lineage(connection, clinic_id, patient_id)
             data: dict[str, Any] = {"patient_id": patient_id, "external_ref": patient["external_ref"],
                                     "display_name": patient["display_name"], "state": patient["state"]}
+            if len(lineage) > 1:
+                data["merged_from"] = sorted(item for item in lineage if item != patient_id)
             for section in selected:
-                data[section] = self._section(connection, section, patient)
+                data[section] = self._section(connection, section, patient, lineage)
             body = {"format": "careflow-patient-export-v1", "clinic_id": clinic_id, "exported_at": now,
                     "consent_id": consent["id"], "sections": selected, "data": data}
             canonical = encode_json(body)
@@ -72,39 +77,40 @@ class PatientExportService:
         return result
 
     @staticmethod
-    def _section(connection, section: str, patient):
+    def _section(connection, section: str, patient, lineage: list[str]):
         patient_id = patient["id"]
+        marks = ",".join("?" for _ in lineage)
         if section == "profile":
             # 通过字段白名单避免联系方式密文、合并目标等内部字段外泄。
             return {"patient_id": patient_id, "external_ref": patient["external_ref"],
                     "display_name": patient["display_name"], "birth_date": patient["birth_date"],
                     "state": patient["state"], "created_at": patient["created_at"]}
         if section == "consents":
-            rows = connection.execute("SELECT purpose,revision,text_digest,state,effective_at,expires_at,created_at FROM consents WHERE patient_id=? ORDER BY purpose,revision", (patient_id,)).fetchall()
+            rows = connection.execute(f"SELECT patient_id,purpose,revision,text_digest,state,effective_at,expires_at,created_at FROM consents WHERE patient_id IN ({marks}) ORDER BY patient_id,purpose,revision", lineage).fetchall()
             return [dict(row) for row in rows]
         if section == "assessments":
-            rows = connection.execute("SELECT id,kind,captured_at,captured_by,measurements_json,answers_json,source,status,signed_at,version FROM assessments WHERE patient_id=? ORDER BY captured_at,id", (patient_id,)).fetchall()
-            return [{"id": row["id"], "kind": row["kind"], "captured_at": row["captured_at"],
+            rows = connection.execute(f"SELECT id,patient_id,kind,captured_at,captured_by,measurements_json,answers_json,source,status,signed_at,version FROM assessments WHERE patient_id IN ({marks}) ORDER BY captured_at,id", lineage).fetchall()
+            return [{"id": row["id"], "patient_id": row["patient_id"], "kind": row["kind"], "captured_at": row["captured_at"],
                      "captured_by": row["captured_by"], "measurements": decode_json(row["measurements_json"]),
                      "answers": decode_json(row["answers_json"]), "source": row["source"],
                      "status": row["status"], "signed_at": row["signed_at"], "version": row["version"]} for row in rows]
         if section == "plans":
-            rows = connection.execute("SELECT id,kind,state,created_by,clinical_owner,assessment_id,consent_id,goal_json,risk_json,start_date,target_date,created_at,updated_at,version FROM plans WHERE patient_id=? ORDER BY created_at,id", (patient_id,)).fetchall()
-            return [{"id": row["id"], "kind": row["kind"], "state": row["state"], "created_by": row["created_by"],
+            rows = connection.execute(f"SELECT id,patient_id,kind,state,created_by,clinical_owner,assessment_id,consent_id,goal_json,risk_json,start_date,target_date,created_at,updated_at,version FROM plans WHERE patient_id IN ({marks}) ORDER BY created_at,id", lineage).fetchall()
+            return [{"id": row["id"], "patient_id": row["patient_id"], "kind": row["kind"], "state": row["state"], "created_by": row["created_by"],
                      "clinical_owner": row["clinical_owner"], "assessment_id": row["assessment_id"], "consent_id": row["consent_id"],
                      "goal": decode_json(row["goal_json"]), "risk": decode_json(row["risk_json"]),
                      "start_date": row["start_date"], "target_date": row["target_date"],
                      "created_at": row["created_at"], "updated_at": row["updated_at"], "version": row["version"]} for row in rows]
         if section == "observations":
-            rows = connection.execute("SELECT id,plan_id,kind,value_num,value_text,unit,observed_at,recorded_by,provenance,correction_of,created_at FROM observations WHERE patient_id=? ORDER BY observed_at,id", (patient_id,)).fetchall()
+            rows = connection.execute(f"SELECT id,patient_id,plan_id,kind,value_num,value_text,unit,observed_at,recorded_by,provenance,correction_of,created_at FROM observations WHERE patient_id IN ({marks}) ORDER BY observed_at,id", lineage).fetchall()
             return [dict(row) for row in rows]
         if section == "appointments":
-            rows = connection.execute("SELECT id,plan_id,staff_id,kind,starts_at,ends_at,state,created_at,version FROM appointments WHERE patient_id=? ORDER BY starts_at,id", (patient_id,)).fetchall()
+            rows = connection.execute(f"SELECT id,patient_id,plan_id,staff_id,kind,starts_at,ends_at,state,created_at,version FROM appointments WHERE patient_id IN ({marks}) ORDER BY starts_at,id", lineage).fetchall()
             return [dict(row) for row in rows]
         if section == "followups":
-            rows = connection.execute("SELECT id,plan_id,due_at,channel,reason,state,assigned_to,outcome,created_at,version FROM followups WHERE patient_id=? ORDER BY due_at,id", (patient_id,)).fetchall()
+            rows = connection.execute(f"SELECT id,patient_id,plan_id,due_at,channel,reason,state,assigned_to,outcome,created_at,version FROM followups WHERE patient_id IN ({marks}) ORDER BY due_at,id", lineage).fetchall()
             return [dict(row) for row in rows]
         if section == "incidents":
-            rows = connection.execute("SELECT id,plan_id,encounter_id,severity,state,category,onset_at,reported_at,reported_by,assigned_to,summary,version FROM incidents WHERE patient_id=? ORDER BY reported_at,id", (patient_id,)).fetchall()
+            rows = connection.execute(f"SELECT id,patient_id,plan_id,encounter_id,severity,state,category,onset_at,reported_at,reported_by,assigned_to,summary,version FROM incidents WHERE patient_id IN ({marks}) ORDER BY reported_at,id", lineage).fetchall()
             return [dict(row) for row in rows]
         raise ValidationError("导出章节无效")

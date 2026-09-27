@@ -11,8 +11,8 @@
 ## 患者、评估与诊疗计划
 
 - `POST /patients` 建立诊所内患者档案；外部编号在诊所范围内唯一。
-- `GET /patients/{patient_id}` 返回最小档案，不返回联系方式密文。
-- `POST /patients/{patient_id}/merge` 以两个版本号和书面原因将重复档案标记为合并，并指向保留档案。
+- `GET /patients/{patient_id}` 返回最小档案，不返回联系方式密文。已合并档案额外返回 `merged_into` 与 `merge`（去向、时间、原因、登记编号）；保留档案额外返回 `merged_sources`（已并入的旧编号及其外部编号）。
+- `POST /patients/{patient_id}/merge` 以两个版本号和书面原因将重复档案并入 `target_id` 指定的保留档案。合并不搬移业务数据：源档案标记为已合并，原有评估、测量、授权、随访、就诊与审计记录仍挂在原编号下，保留档案的各查询接口（时间线、评估列表、测量序列、授权历史、安全关注项、计划历史、导出）会把两侧记录一并返回，每条记录以 `patient_id` 标明最初所属档案编号。合并登记、源档案状态与双侧审计事件在同一事务内提交，版本校验失败或并发冲突时整体回滚；同一来源档案重复提交同一合并返回首次结果（`replayed: true`），不会重复登记或重复追加审计事件；已合并档案不能再次作为来源或目标。旧编号之后的读取仍返回其自身历史并标明归并去向，诊所边界之外的查询一律返回不存在。
 - `POST /patients/{patient_id}/assessments` 新建评估草稿；`POST /assessments/{assessment_id}/sign` 由临床岗位签署。
 - `POST /patients/{patient_id}/consents` 创建更高版本的授权；`POST /consents/{consent_id}/withdraw` 撤回授权。
 - `POST /patients/{patient_id}/plans` 建立计划，医美和体重管理计划必须引用当前对应授权。
@@ -44,6 +44,8 @@
 `POST /patients/{patient_id}/export` 只在存在有效数据导出授权时返回明确选择的章节。导出字段采用白名单，联系方式密文、凭据和内部合并字段不会导出；相同幂等请求得到相同内容摘要。`GET /reports/daily`、`appointments`、`incidents` 和 `overdue-milestones` 仅返回运营汇总或经岗位授权的工作队列。
 
 ## 主要状态
+
+- 患者：在诊 → 已合并（单向指向保留档案）或关闭；已合并档案不再接受新记录，其历史经谱系展开并入保留档案的读取结果，原始档案编号随记录保留。
 
 - 计划：草稿 → 提议 → 生效；可暂停和恢复，完成或取消后不能重新激活。
 - 预约：占位 → 确认 → 到诊 → 服务中 → 完成；取消和未到诊是独立终态。
